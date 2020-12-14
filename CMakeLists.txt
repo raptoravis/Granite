@@ -752,6 +752,8 @@ if (NOT GRANITE_VULKAN_ONLY)
 
     add_subdirectory(tests)
     add_subdirectory(viewer)
+	
+	add_subdirectory(samples)
 
     if (GRANITE_TOOLS)
         add_subdirectory(tools)
