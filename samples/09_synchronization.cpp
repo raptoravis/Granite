@@ -20,116 +20,153 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "vulkan.hpp"
-#include "device.hpp"
-#include "wsi.hpp"
-#include "util.hpp"
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
-#include <future>
+#include "application.hpp"
+#include "os_filesystem.hpp"
+#include "render_graph.hpp"
+#include "task_composer.hpp"
+#include <string.h>
 
-// See sample 06 for details.
-struct SDL2Platform : Vulkan::WSIPlatform
+using namespace Granite;
+using namespace Vulkan;
+
+struct RenderGraphSandboxApplication : Granite::Application, Granite::EventHandler
 {
-	explicit SDL2Platform(SDL_Window *window_)
-		: window(window_)
+	RenderGraphSandboxApplication()
 	{
+		EVENT_MANAGER_REGISTER_LATCH(RenderGraphSandboxApplication, on_swapchain_created, on_swapchain_destroyed,
+		                             SwapchainParameterEvent);
 	}
 
-	VkSurfaceKHR create_surface(VkInstance instance, VkPhysicalDevice) override
+	void on_swapchain_created(const SwapchainParameterEvent &e)
 	{
-		VkSurfaceKHR surface;
-		if (SDL_Vulkan_CreateSurface(window, instance, &surface))
-			return surface;
-		else
-			return VK_NULL_HANDLE;
-	}
+		graph.reset();
+		graph.set_device(&e.get_device());
 
-	std::vector<const char *> get_instance_extensions() override
-	{
-		unsigned instance_ext_count = 0;
-		SDL_Vulkan_GetInstanceExtensions(window, &instance_ext_count, nullptr);
-		std::vector<const char *> instance_names(instance_ext_count);
-		SDL_Vulkan_GetInstanceExtensions(window, &instance_ext_count, instance_names.data());
-		return instance_names;
-	}
+		ResourceDimensions dim;
+		dim.width = e.get_width();
+		dim.height = e.get_height();
+		dim.format = e.get_format();
+		graph.set_backbuffer_dimensions(dim);
 
-	uint32_t get_surface_width() override
-	{
-		int w, h;
-		SDL_Vulkan_GetDrawableSize(window, &w, &h);
-		return w;
-	}
+		AttachmentInfo back;
 
-	uint32_t get_surface_height() override
-	{
-		int w, h;
-		SDL_Vulkan_GetDrawableSize(window, &w, &h);
-		return h;
-	}
+		AttachmentInfo im;
+		im.format = VK_FORMAT_R8G8B8A8_UNORM;
+		im.size_x = 1280.0f;
+		im.size_y = 720.0f;
+		im.size_class = SizeClass::Absolute;
 
-	bool alive(Vulkan::WSI &) override
-	{
-		return is_alive;
-	}
+		// Pretend depth pass.
+		auto &depth = graph.add_pass("depth", RENDER_GRAPH_QUEUE_GRAPHICS_BIT);
+		depth.add_color_output("depth", back);
 
-	void poll_input() override
-	{
-		SDL_Event e;
-		while (SDL_PollEvent(&e))
-		{
-			switch (e.type)
+		depth.set_get_clear_color([](unsigned, VkClearColorValue *value) -> bool {
+			if (value)
 			{
-			case SDL_QUIT:
-				is_alive = false;
-				break;
-
-			default:
-				break;
+				value->float32[0] = 0.0f;
+				value->float32[1] = 1.0f;
+				value->float32[2] = 0.0f;
+				value->float32[3] = 1.0f;
 			}
-		}
+			return true;
+		});
+
+		depth.set_build_render_pass([&](Vulkan::CommandBuffer &cmd) {
+			CommandBufferUtil::setup_fullscreen_quad(cmd, "builtin://shaders/quad.vert",
+			                                         "assets://shaders/additive.frag");
+			cmd.set_blend_enable(true);
+			cmd.set_blend_factors(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+			CommandBufferUtil::draw_fullscreen_quad(cmd, 20);
+		});
+
+		// Pretend main rendering pass.
+		auto &graphics = graph.add_pass("first", RENDER_GRAPH_QUEUE_GRAPHICS_BIT);
+		auto &first = graphics.add_color_output("first", back);
+		graphics.add_texture_input("depth");
+		graphics.set_get_clear_color([](unsigned, VkClearColorValue *value) -> bool {
+			if (value)
+			{
+				value->float32[0] = 1.0f;
+				value->float32[1] = 0.0f;
+				value->float32[2] = 1.0f;
+				value->float32[3] = 1.0f;
+			}
+			return true;
+		});
+
+		graphics.set_build_render_pass([&](Vulkan::CommandBuffer &cmd) {
+			CommandBufferUtil::setup_fullscreen_quad(cmd, "builtin://shaders/quad.vert",
+			                                         "assets://shaders/additive.frag");
+			cmd.set_blend_enable(true);
+			cmd.set_blend_factors(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+			CommandBufferUtil::draw_fullscreen_quad(cmd, 80);
+		});
+
+		// Post processing
+		auto &compute = graph.add_pass("compute", RENDER_GRAPH_QUEUE_ASYNC_COMPUTE_BIT);
+		auto &i = compute.add_storage_texture_output("image", im);
+		compute.add_texture_input("first");
+		compute.set_build_render_pass([&](Vulkan::CommandBuffer &cmd) {
+			auto &device = get_wsi().get_device();
+			auto *program = device.get_shader_manager().register_compute("assets://shaders/image_write.comp");
+			auto *variant = program->register_variant({});
+			cmd.set_program(variant->get_program());
+			cmd.set_storage_texture(0, 0, graph.get_physical_texture_resource(i));
+			cmd.set_texture(0, 1, graph.get_physical_texture_resource(first), StockSampler::LinearClamp);
+			cmd.dispatch(1280 / 8, 720 / 8, 40);
+		});
+
+		// Composite + UI
+		auto &swap = graph.add_pass("final", RENDER_GRAPH_QUEUE_ASYNC_GRAPHICS_BIT);
+		swap.add_color_output("back", back);
+		swap.add_texture_input("image");
+		swap.add_texture_input("first");
+		swap.set_build_render_pass([&](Vulkan::CommandBuffer &cmd) {
+			cmd.set_texture(0, 0, graph.get_physical_texture_resource(i), StockSampler::LinearClamp);
+			cmd.set_texture(0, 1, graph.get_physical_texture_resource(first), StockSampler::LinearClamp);
+			CommandBufferUtil::draw_fullscreen_quad(cmd, "builtin://shaders/quad.vert", "builtin://shaders/blit.frag");
+		});
+
+		graph.set_backbuffer_source("back");
+		graph.bake();
+		graph.log();
+
+		auto &wsi = get_wsi();
+		wsi.set_backbuffer_srgb(true); // Always choose SRGB backbuffer formats over UNORM. Can be toggled in run-time.
+
+		// In this sample we are going to render to an off-screen surface in the graphics queue,
+		// copy it back to the user in the transfer/DMA queue and read the results.
+		// NOTE: This is a pretty silly way to use multiple queues in Vulkan, but this is the shortest example I can
+		// think of where we demonstrate barriers, readbacks, image layouts, semaphores and fences.
+
+		rt_info = Vulkan::ImageCreateInfo::render_target(4, 4, VK_FORMAT_R8G8B8A8_UNORM);
+		rt_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		rt_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+		// This controls if we have EXCLUSIVE queue family or CONCURRENT queue family sharing.
+		// In Vulkan, we can get a theoretical gain by exclusively handing off ownership between queues, but the easy way is to declare up front
+		// that we're going to use this image by both without having to mess around with ownership transfers.
+		rt_info.misc =
+		    Vulkan::IMAGE_MISC_CONCURRENT_QUEUE_ASYNC_TRANSFER_BIT | Vulkan::IMAGE_MISC_CONCURRENT_QUEUE_GRAPHICS_BIT;
+
+		buffer_readback_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		// We're going to read from this buffer on CPU, so better make sure it's a CACHED pointer!
+		buffer_readback_info.domain = Vulkan::BufferDomain::CachedHost;
+		buffer_readback_info.size = 4 * 4 * sizeof(uint32_t);
 	}
 
-	SDL_Window *window;
-	bool is_alive = true;
-};
-
-static bool run_application(SDL_Window *window)
-{
-	// Copy-pastaed from sample 06.
-	SDL2Platform platform(window);
-
-	Vulkan::WSI wsi;
-	wsi.set_platform(&platform);
-	wsi.set_backbuffer_srgb(true); // Always choose SRGB backbuffer formats over UNORM. Can be toggled in run-time.
-	if (!wsi.init(1 /*num_thread_indices*/))
-		return false;
-
-	Vulkan::Device &device = wsi.get_device();
-
-	// In this sample we are going to render to an off-screen surface in the graphics queue,
-	// copy it back to the user in the transfer/DMA queue and read the results.
-	// NOTE: This is a pretty silly way to use multiple queues in Vulkan, but this is the shortest example I can
-	// think of where we demonstrate barriers, readbacks, image layouts, semaphores and fences.
-
-	Vulkan::ImageCreateInfo rt_info = Vulkan::ImageCreateInfo::render_target(4, 4, VK_FORMAT_R8G8B8A8_UNORM);
-	rt_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	rt_info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-	// This controls if we have EXCLUSIVE queue family or CONCURRENT queue family sharing.
-	// In Vulkan, we can get a theoretical gain by exclusively handing off ownership between queues, but the easy way is to declare up front
-	// that we're going to use this image by both without having to mess around with ownership transfers.
-	rt_info.misc = Vulkan::IMAGE_MISC_CONCURRENT_QUEUE_ASYNC_TRANSFER_BIT | Vulkan::IMAGE_MISC_CONCURRENT_QUEUE_GRAPHICS_BIT;
-
-	Vulkan::BufferCreateInfo buffer_readback_info;
-	buffer_readback_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	// We're going to read from this buffer on CPU, so better make sure it's a CACHED pointer!
-	buffer_readback_info.domain = Vulkan::BufferDomain::CachedHost;
-	buffer_readback_info.size = 4 * 4 * sizeof(uint32_t);
-
-	while (platform.is_alive)
+	void on_swapchain_destroyed(const SwapchainParameterEvent &)
 	{
-		wsi.begin_frame();
+	}
+
+	Vulkan::ImageCreateInfo rt_info;
+	Vulkan::BufferCreateInfo buffer_readback_info;
+
+	void render_frame(double, double)
+	{
+		auto &wsi = get_wsi();
+		auto &device = wsi.get_device();
+
 		auto graphics_cmd = device.request_command_buffer(Vulkan::CommandBuffer::Type::Generic);
 
 		// Now we're starting to see manual synchronization come into play.
@@ -158,8 +195,8 @@ static bool run_application(SDL_Window *window)
 		// This translates directly to vkCmdPipelineBarrier with a VkImageMemoryBarrier.
 		// This image is fresh, so just wait for TOP_OF_PIPE_BIT (i.e. don't wait at all).
 		graphics_cmd->image_barrier(*rt, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
 		// There are many variants of barriers in Vulkan::CommandBuffer.
 		// It's possible to use the "raw" interfaces for purposes of batching image barriers for example.
@@ -208,15 +245,17 @@ static bool run_application(SDL_Window *window)
 
 		// Inject the semaphore in the transfer queue, where it should block the TRANSFER stage until we're done rendering.
 		// We can only wait for a semaphore once. This can be a bit icky if you need to wait in multiple queues, hopefully we'll see some API improvements here.
-		device.add_wait_semaphore(Vulkan::CommandBuffer::Type::AsyncTransfer, graphics_to_transfer_sem, VK_PIPELINE_STAGE_TRANSFER_BIT, true);
+		device.add_wait_semaphore(Vulkan::CommandBuffer::Type::AsyncTransfer, graphics_to_transfer_sem,
+		                          VK_PIPELINE_STAGE_TRANSFER_BIT, true);
 
 		// Create a new buffer which we will copy the image to and readback on CPU asynchronously.
 		auto buffer_readback = device.create_buffer(buffer_readback_info);
 		auto transfer_cmd = device.request_command_buffer(Vulkan::CommandBuffer::Type::AsyncTransfer);
-		transfer_cmd->copy_image_to_buffer(*buffer_readback, *rt, 0, {}, { 4, 4, 1 }, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
+		transfer_cmd->copy_image_to_buffer(*buffer_readback, *rt, 0, {}, { 4, 4, 1 }, 0, 0,
+		                                   { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
 		// In order observe reads on the host, you have to do this memory barrier in Vulkan.
-		transfer_cmd->barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-		                      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+		transfer_cmd->barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+		                      VK_ACCESS_HOST_READ_BIT);
 
 		// Signal a fence. The fence will signal once the readback is complete, and then we can read back the data.
 		// This is very straight forward.
@@ -231,7 +270,8 @@ static bool run_application(SDL_Window *window)
 
 			// The only thing mapping buffers does is to potentially invalidate CPU caches,
 			// no vkMapMemory overhead and other shenanigans.
-			auto *data = static_cast<const uint32_t *>(device.map_host_buffer(*buffer_readback, Vulkan::MEMORY_ACCESS_READ_BIT));
+			auto *data =
+			    static_cast<const uint32_t *>(device.map_host_buffer(*buffer_readback, Vulkan::MEMORY_ACCESS_READ_BIT));
 			for (unsigned y = 0; y < 4; y++)
 				for (unsigned x = 0; x < 4; x++)
 					LOGI("Pixel %u, %u is: 0x%08x\n", x, y, data[y * 4 + x]);
@@ -249,37 +289,38 @@ static bool run_application(SDL_Window *window)
 		// As we expect, semaphores and fences are recycled using the frame context to know when to recycle the VkSemaphore
 		// and VkFence objects back to the fence/semaphore pools.
 
-		wsi.end_frame();
+		graph.setup_attachments(device, &device.get_swapchain_view());
+		TaskComposer composer(*Global::thread_group());
+		graph.enqueue_render_passes(device, composer);
+		composer.get_outgoing_task()->wait();
 	}
 
-	return true;
-}
+	RenderGraph graph;
+};
 
-int main()
+namespace Granite
 {
-	// Copy-pastaed from sample 06.
-	SDL_Window *window = SDL_CreateWindow("09-synchronization", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-	                                      640, 360,
-	                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-	if (!window)
-	{
-		LOGE("Failed to create SDL window!\n");
-		return 1;
-	}
+Application *application_create(int, char **)
+{
+	application_dummy();
 
-	// Init loader with GetProcAddr directly from SDL2 rather than letting Granite load the Vulkan loader.
-	if (!Vulkan::Context::init_loader((PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr()))
-	{
-		LOGE("Failed to create loader!\n");
-		return 1;
-	}
+#ifdef ASSET_DIRECTORY
+	const char *asset_dir = getenv("ASSET_DIRECTORY");
+	if (!asset_dir)
+		asset_dir = ASSET_DIRECTORY;
 
-	if (!run_application(window))
-	{
-		LOGE("Failed to run application.\n");
-		return 1;
-	}
+	Global::filesystem()->register_protocol("assets", std::unique_ptr<FilesystemBackend>(new OSFilesystem(asset_dir)));
+#endif
 
-	SDL_DestroyWindow(window);
-	SDL_Vulkan_UnloadLibrary();
+	try
+	{
+		auto *app = new RenderGraphSandboxApplication();
+		return app;
+	}
+	catch (const std::exception &e)
+	{
+		LOGE("application_create() threw exception: %s\n", e.what());
+		return nullptr;
+	}
 }
+} // namespace Granite

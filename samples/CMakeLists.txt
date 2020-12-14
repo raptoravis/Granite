@@ -23,5 +23,14 @@ if (NOT ANDROID)
     target_compile_definitions(05_descriptor_sets_and_binding_model PRIVATE ASSET_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/assets\")
 endif()
 
-#add_granite_application(06_wsi_sdl2 06_wsi_sdl2.cpp)
-#target_compile_definitions(06_wsi_sdl2 PRIVATE ASSET_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/assets\")
+add_granite_application(07_linear_allocators 07_linear_allocators.cpp)
+target_compile_definitions(07_linear_allocators PRIVATE ASSET_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/assets\")
+
+add_granite_application(08_render_passes 08_render_passes.cpp)
+target_compile_definitions(08_render_passes PRIVATE ASSET_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/assets\")
+
+add_granite_application(09_synchronization 09_synchronization.cpp)
+target_compile_definitions(09_synchronization PRIVATE ASSET_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/assets\")
+
+add_granite_application(10_pipelines 10_pipelines.cpp)
+target_compile_definitions(10_pipelines PRIVATE ASSET_DIRECTORY=\"${CMAKE_CURRENT_SOURCE_DIR}/assets\")

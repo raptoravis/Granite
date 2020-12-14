@@ -20,119 +20,56 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "vulkan.hpp"
+#include "application.hpp"
+#include "command_buffer.hpp"
 #include "device.hpp"
-#include "wsi.hpp"
-#include "util.hpp"
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
+#include "math.hpp"
+#include "os_filesystem.hpp"
+#include <string.h>
 
-// See sample 06 for details.
-struct SDL2Platform : Vulkan::WSIPlatform
-{
-	explicit SDL2Platform(SDL_Window *window_)
-		: window(window_)
-	{
-	}
-
-	VkSurfaceKHR create_surface(VkInstance instance, VkPhysicalDevice) override
-	{
-		VkSurfaceKHR surface;
-		if (SDL_Vulkan_CreateSurface(window, instance, &surface))
-			return surface;
-		else
-			return VK_NULL_HANDLE;
-	}
-
-	std::vector<const char *> get_instance_extensions() override
-	{
-		unsigned instance_ext_count = 0;
-		SDL_Vulkan_GetInstanceExtensions(window, &instance_ext_count, nullptr);
-		std::vector<const char *> instance_names(instance_ext_count);
-		SDL_Vulkan_GetInstanceExtensions(window, &instance_ext_count, instance_names.data());
-		return instance_names;
-	}
-
-	uint32_t get_surface_width() override
-	{
-		int w, h;
-		SDL_Vulkan_GetDrawableSize(window, &w, &h);
-		return w;
-	}
-
-	uint32_t get_surface_height() override
-	{
-		int w, h;
-		SDL_Vulkan_GetDrawableSize(window, &w, &h);
-		return h;
-	}
-
-	bool alive(Vulkan::WSI &) override
-	{
-		return is_alive;
-	}
-
-	void poll_input() override
-	{
-		SDL_Event e;
-		while (SDL_PollEvent(&e))
-		{
-			switch (e.type)
-			{
-			case SDL_QUIT:
-				is_alive = false;
-				break;
-
-			default:
-				break;
-			}
-		}
-	}
-
-	SDL_Window *window;
-	bool is_alive = true;
-};
+using namespace Granite;
+using namespace Vulkan;
 
 static const uint32_t gbuffer_vert[] =
 #include "shaders/gbuffer.vert.inc"
-;
+    ;
 
 static const uint32_t gbuffer_frag[] =
 #include "shaders/gbuffer.frag.inc"
-;
+    ;
 
 static const uint32_t lighting_vert[] =
 #include "shaders/lighting.vert.inc"
-;
+    ;
 
 static const uint32_t lighting_frag[] =
 #include "shaders/lighting.frag.inc"
-;
+    ;
 
-static bool run_application(SDL_Window *window)
+struct TriangleApplication : Granite::Application, Granite::EventHandler
 {
-	// Copy-pastaed from sample 06.
-	SDL2Platform platform(window);
 
-	Vulkan::WSI wsi;
-	wsi.set_platform(&platform);
-	wsi.set_backbuffer_srgb(true); // Always choose SRGB backbuffer formats over UNORM. Can be toggled in run-time.
-	if (!wsi.init(1 /*num_thread_indices*/))
-		return false;
+	Vulkan::Program *gbuffer_prog;
+	Vulkan::Program *lighting_prog;
 
-	Vulkan::Device &device = wsi.get_device();
-
-	Vulkan::Program *gbuffer_prog = device.request_program(
-			device.request_shader(gbuffer_vert, sizeof(gbuffer_vert)),
-			device.request_shader(gbuffer_frag, sizeof(gbuffer_frag)));
-
-	Vulkan::Program *lighting_prog = device.request_program(
-			device.request_shader(lighting_vert, sizeof(lighting_vert)),
-			device.request_shader(lighting_frag, sizeof(lighting_frag)));
-
-	while (platform.is_alive)
+	void on_swapchain_created(const SwapchainParameterEvent &e)
 	{
-		wsi.begin_frame();
+		auto &wsi = get_wsi();
+		auto &device = wsi.get_device();
+
+		Vulkan::Program *gbuffer_prog =
+		    device.request_program(device.request_shader(gbuffer_vert, sizeof(gbuffer_vert)),
+		                           device.request_shader(gbuffer_frag, sizeof(gbuffer_frag)));
+
+		Vulkan::Program *lighting_prog =
+		    device.request_program(device.request_shader(lighting_vert, sizeof(lighting_vert)),
+		                           device.request_shader(lighting_frag, sizeof(lighting_frag)));
+	}
+
+	void render_frame(double, double)
+	{
+		auto &wsi = get_wsi();
+		auto &device = wsi.get_device();
 
 		auto cmd = device.request_command_buffer();
 
@@ -171,23 +108,18 @@ static bool run_application(SDL_Window *window)
 		// This automatic synchronization is theoretically inoptimal on the GPU, since we might emit
 		// redundant barriers. There might be room to enable "explicit sync" for transient attachments as well,
 		// particularly in the render graph.
-		rp.color_attachments[1] = &device.get_transient_attachment(
-				device.get_swapchain_view().get_image().get_width(),
-				device.get_swapchain_view().get_image().get_height(),
-				VK_FORMAT_R8G8B8A8_UNORM,
-				0);
-		rp.color_attachments[2] = &device.get_transient_attachment(
-				device.get_swapchain_view().get_image().get_width(),
-				device.get_swapchain_view().get_image().get_height(),
-				VK_FORMAT_R8G8B8A8_UNORM,
-				1);
+		rp.color_attachments[1] = &device.get_transient_attachment(device.get_swapchain_view().get_image().get_width(),
+		                                                           device.get_swapchain_view().get_image().get_height(),
+		                                                           VK_FORMAT_R8G8B8A8_UNORM, 0);
+		rp.color_attachments[2] = &device.get_transient_attachment(device.get_swapchain_view().get_image().get_width(),
+		                                                           device.get_swapchain_view().get_image().get_height(),
+		                                                           VK_FORMAT_R8G8B8A8_UNORM, 1);
 
 		// Depth format support varies across devices, so there's a generic "default depth" or depth-stencil format
 		// which is either D24 or D32F depending on hardware.
-		rp.depth_stencil = &device.get_transient_attachment(
-				device.get_swapchain_view().get_image().get_width(),
-				device.get_swapchain_view().get_image().get_height(),
-				device.get_default_depth_format());
+		rp.depth_stencil = &device.get_transient_attachment(device.get_swapchain_view().get_image().get_width(),
+		                                                    device.get_swapchain_view().get_image().get_height(),
+		                                                    device.get_default_depth_format());
 
 		// Explicit store, load and clear, the way it should be.
 		// This is also very important for tile-based GPUs.
@@ -256,37 +188,32 @@ static bool run_application(SDL_Window *window)
 		}
 		cmd->end_render_pass();
 		device.submit(cmd);
-		wsi.end_frame();
 	}
+};
 
-	return true;
-}
-
-int main()
+namespace Granite
 {
-	// Copy-pastaed from sample 06.
-	SDL_Window *window = SDL_CreateWindow("08-render-passes", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-	                                      640, 360,
-	                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-	if (!window)
-	{
-		LOGE("Failed to create SDL window!\n");
-		return 1;
-	}
+Application *application_create(int, char **)
+{
+	application_dummy();
 
-	// Init loader with GetProcAddr directly from SDL2 rather than letting Granite load the Vulkan loader.
-	if (!Vulkan::Context::init_loader((PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr()))
-	{
-		LOGE("Failed to create loader!\n");
-		return 1;
-	}
+#ifdef ASSET_DIRECTORY
+	const char *asset_dir = getenv("ASSET_DIRECTORY");
+	if (!asset_dir)
+		asset_dir = ASSET_DIRECTORY;
 
-	if (!run_application(window))
-	{
-		LOGE("Failed to run application.\n");
-		return 1;
-	}
+	Global::filesystem()->register_protocol("assets", std::unique_ptr<FilesystemBackend>(new OSFilesystem(asset_dir)));
+#endif
 
-	SDL_DestroyWindow(window);
-	SDL_Vulkan_UnloadLibrary();
+	try
+	{
+		auto *app = new TriangleApplication();
+		return app;
+	}
+	catch (const std::exception &e)
+	{
+		LOGE("application_create() threw exception: %s\n", e.what());
+		return nullptr;
+	}
 }
+} // namespace Granite

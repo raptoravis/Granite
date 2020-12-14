@@ -20,95 +20,129 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "vulkan.hpp"
-#include "device.hpp"
-#include "wsi.hpp"
-#include "util.hpp"
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
+#include "application.hpp"
+#include "os_filesystem.hpp"
+#include "render_graph.hpp"
+#include "task_composer.hpp"
+#include <string.h>
 
-// See sample 06 for details.
-struct SDL2Platform : Vulkan::WSIPlatform
+using namespace Granite;
+using namespace Vulkan;
+
+struct RenderGraphSandboxApplication : Granite::Application, Granite::EventHandler
 {
-	explicit SDL2Platform(SDL_Window *window_)
-		: window(window_)
+	RenderGraphSandboxApplication()
 	{
+		EVENT_MANAGER_REGISTER_LATCH(RenderGraphSandboxApplication, on_swapchain_created, on_swapchain_destroyed,
+		                             SwapchainParameterEvent);
 	}
 
-	VkSurfaceKHR create_surface(VkInstance instance, VkPhysicalDevice) override
+	void on_swapchain_created(const SwapchainParameterEvent &e)
 	{
-		VkSurfaceKHR surface;
-		if (SDL_Vulkan_CreateSurface(window, instance, &surface))
-			return surface;
-		else
-			return VK_NULL_HANDLE;
-	}
+		graph.reset();
+		graph.set_device(&e.get_device());
 
-	std::vector<const char *> get_instance_extensions() override
-	{
-		unsigned instance_ext_count = 0;
-		SDL_Vulkan_GetInstanceExtensions(window, &instance_ext_count, nullptr);
-		std::vector<const char *> instance_names(instance_ext_count);
-		SDL_Vulkan_GetInstanceExtensions(window, &instance_ext_count, instance_names.data());
-		return instance_names;
-	}
+		ResourceDimensions dim;
+		dim.width = e.get_width();
+		dim.height = e.get_height();
+		dim.format = e.get_format();
+		graph.set_backbuffer_dimensions(dim);
 
-	uint32_t get_surface_width() override
-	{
-		int w, h;
-		SDL_Vulkan_GetDrawableSize(window, &w, &h);
-		return w;
-	}
+		AttachmentInfo back;
 
-	uint32_t get_surface_height() override
-	{
-		int w, h;
-		SDL_Vulkan_GetDrawableSize(window, &w, &h);
-		return h;
-	}
+		AttachmentInfo im;
+		im.format = VK_FORMAT_R8G8B8A8_UNORM;
+		im.size_x = 1280.0f;
+		im.size_y = 720.0f;
+		im.size_class = SizeClass::Absolute;
 
-	bool alive(Vulkan::WSI &) override
-	{
-		return is_alive;
-	}
+		// Pretend depth pass.
+		auto &depth = graph.add_pass("depth", RENDER_GRAPH_QUEUE_GRAPHICS_BIT);
+		depth.add_color_output("depth", back);
 
-	void poll_input() override
-	{
-		SDL_Event e;
-		while (SDL_PollEvent(&e))
-		{
-			switch (e.type)
+		depth.set_get_clear_color([](unsigned, VkClearColorValue *value) -> bool {
+			if (value)
 			{
-			case SDL_QUIT:
-				is_alive = false;
-				break;
-
-			default:
-				break;
+				value->float32[0] = 0.0f;
+				value->float32[1] = 1.0f;
+				value->float32[2] = 0.0f;
+				value->float32[3] = 1.0f;
 			}
-		}
+			return true;
+		});
+
+		depth.set_build_render_pass([&](Vulkan::CommandBuffer &cmd) {
+			CommandBufferUtil::setup_fullscreen_quad(cmd, "builtin://shaders/quad.vert",
+			                                         "assets://shaders/additive.frag");
+			cmd.set_blend_enable(true);
+			cmd.set_blend_factors(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+			CommandBufferUtil::draw_fullscreen_quad(cmd, 20);
+		});
+
+		// Pretend main rendering pass.
+		auto &graphics = graph.add_pass("first", RENDER_GRAPH_QUEUE_GRAPHICS_BIT);
+		auto &first = graphics.add_color_output("first", back);
+		graphics.add_texture_input("depth");
+		graphics.set_get_clear_color([](unsigned, VkClearColorValue *value) -> bool {
+			if (value)
+			{
+				value->float32[0] = 1.0f;
+				value->float32[1] = 0.0f;
+				value->float32[2] = 1.0f;
+				value->float32[3] = 1.0f;
+			}
+			return true;
+		});
+
+		graphics.set_build_render_pass([&](Vulkan::CommandBuffer &cmd) {
+			CommandBufferUtil::setup_fullscreen_quad(cmd, "builtin://shaders/quad.vert",
+			                                         "assets://shaders/additive.frag");
+			cmd.set_blend_enable(true);
+			cmd.set_blend_factors(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+			CommandBufferUtil::draw_fullscreen_quad(cmd, 80);
+		});
+
+		// Post processing
+		auto &compute = graph.add_pass("compute", RENDER_GRAPH_QUEUE_ASYNC_COMPUTE_BIT);
+		auto &i = compute.add_storage_texture_output("image", im);
+		compute.add_texture_input("first");
+		compute.set_build_render_pass([&](Vulkan::CommandBuffer &cmd) {
+			auto &device = get_wsi().get_device();
+			auto *program = device.get_shader_manager().register_compute("assets://shaders/image_write.comp");
+			auto *variant = program->register_variant({});
+			cmd.set_program(variant->get_program());
+			cmd.set_storage_texture(0, 0, graph.get_physical_texture_resource(i));
+			cmd.set_texture(0, 1, graph.get_physical_texture_resource(first), StockSampler::LinearClamp);
+			cmd.dispatch(1280 / 8, 720 / 8, 40);
+		});
+
+		// Composite + UI
+		auto &swap = graph.add_pass("final", RENDER_GRAPH_QUEUE_ASYNC_GRAPHICS_BIT);
+		swap.add_color_output("back", back);
+		swap.add_texture_input("image");
+		swap.add_texture_input("first");
+		swap.set_build_render_pass([&](Vulkan::CommandBuffer &cmd) {
+			cmd.set_texture(0, 0, graph.get_physical_texture_resource(i), StockSampler::LinearClamp);
+			cmd.set_texture(0, 1, graph.get_physical_texture_resource(first), StockSampler::LinearClamp);
+			CommandBufferUtil::draw_fullscreen_quad(cmd, "builtin://shaders/quad.vert", "builtin://shaders/blit.frag");
+		});
+
+		graph.set_backbuffer_source("back");
+		graph.bake();
+		graph.log();
 	}
 
-	SDL_Window *window;
-	bool is_alive = true;
-};
-
-static bool run_application(SDL_Window *window)
-{
-	// Copy-pastaed from sample 06.
-	SDL2Platform platform(window);
-
-	Vulkan::WSI wsi;
-	wsi.set_platform(&platform);
-	wsi.set_backbuffer_srgb(true); // Always choose SRGB backbuffer formats over UNORM. Can be toggled in run-time.
-	if (!wsi.init(1 /*num_thread_indices*/))
-		return false;
-
-	Vulkan::Device &device = wsi.get_device();
-
-	while (platform.is_alive)
+	void on_swapchain_destroyed(const SwapchainParameterEvent &)
 	{
-		wsi.begin_frame();
+	}
+
+	void render_frame(double, double)
+	{
+		auto &wsi = get_wsi();
+		auto &device = wsi.get_device();
+
+		//wsi.begin_frame();
+
 		auto cmd = device.request_command_buffer();
 		auto rp = device.get_swapchain_render_pass(Vulkan::SwapchainRenderPass::ColorOnly);
 		rp.clear_color[0].float32[0] = 0.3f;
@@ -143,14 +177,12 @@ static bool run_application(SDL_Window *window)
 		// This can be considered "global state" for the render pass.
 		// That state is saved, and when rendering individual objects they can override the state if desired, but usually they don't need to.
 		// They only tend to modify the shaders and bindings. The "global" state can be restored between draws.
-		cmd->save_state(Vulkan::COMMAND_BUFFER_SAVED_RENDER_STATE_BIT |
-		                Vulkan::COMMAND_BUFFER_SAVED_BINDINGS_0_BIT |
-		                Vulkan::COMMAND_BUFFER_SAVED_BINDINGS_1_BIT |
-		                Vulkan::COMMAND_BUFFER_SAVED_BINDINGS_2_BIT |
-		                Vulkan::COMMAND_BUFFER_SAVED_BINDINGS_3_BIT |
-		                Vulkan::COMMAND_BUFFER_SAVED_PUSH_CONSTANT_BIT |
-		                Vulkan::COMMAND_BUFFER_SAVED_SCISSOR_BIT |
-		                Vulkan::COMMAND_BUFFER_SAVED_VIEWPORT_BIT, saved);
+		cmd->save_state(Vulkan::COMMAND_BUFFER_SAVED_RENDER_STATE_BIT | Vulkan::COMMAND_BUFFER_SAVED_BINDINGS_0_BIT |
+		                    Vulkan::COMMAND_BUFFER_SAVED_BINDINGS_1_BIT | Vulkan::COMMAND_BUFFER_SAVED_BINDINGS_2_BIT |
+		                    Vulkan::COMMAND_BUFFER_SAVED_BINDINGS_3_BIT |
+		                    Vulkan::COMMAND_BUFFER_SAVED_PUSH_CONSTANT_BIT | Vulkan::COMMAND_BUFFER_SAVED_SCISSOR_BIT |
+		                    Vulkan::COMMAND_BUFFER_SAVED_VIEWPORT_BIT,
+		                saved);
 
 		// Setting some random static state.
 		cmd->set_depth_test(true, true);
@@ -159,7 +191,8 @@ static bool run_application(SDL_Window *window)
 		cmd->set_depth_bias(true);
 		cmd->set_depth_compare(VK_COMPARE_OP_EQUAL);
 		cmd->set_stencil_test(true);
-		cmd->set_stencil_ops(VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_INCREMENT_AND_CLAMP, VK_STENCIL_OP_INVERT);
+		cmd->set_stencil_ops(VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+		                     VK_STENCIL_OP_INVERT);
 		cmd->set_color_write_mask(0xe);
 
 		// This is *potentially* static state. It only participates if the shader program uses these spec constants.
@@ -228,37 +261,41 @@ static bool run_application(SDL_Window *window)
 
 		cmd->end_render_pass();
 		device.submit(cmd);
-		wsi.end_frame();
+
+		//wsi.end_frame();
+
+		graph.setup_attachments(device, &device.get_swapchain_view());
+		TaskComposer composer(*Global::thread_group());
+		graph.enqueue_render_passes(device, composer);
+		composer.get_outgoing_task()->wait();
 	}
 
-	return true;
-}
+	RenderGraph graph;
+};
 
-int main()
+namespace Granite
 {
-	// Copy-pastaed from sample 06.
-	SDL_Window *window = SDL_CreateWindow("10-pipelines", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-	                                      640, 360,
-	                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-	if (!window)
-	{
-		LOGE("Failed to create SDL window!\n");
-		return 1;
-	}
+Application *application_create(int, char **)
+{
+	application_dummy();
 
-	// Init loader with GetProcAddr directly from SDL2 rather than letting Granite load the Vulkan loader.
-	if (!Vulkan::Context::init_loader((PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr()))
-	{
-		LOGE("Failed to create loader!\n");
-		return 1;
-	}
+#ifdef ASSET_DIRECTORY
+	const char *asset_dir = getenv("ASSET_DIRECTORY");
+	if (!asset_dir)
+		asset_dir = ASSET_DIRECTORY;
 
-	if (!run_application(window))
-	{
-		LOGE("Failed to run application.\n");
-		return 1;
-	}
+	Global::filesystem()->register_protocol("assets", std::unique_ptr<FilesystemBackend>(new OSFilesystem(asset_dir)));
+#endif
 
-	SDL_DestroyWindow(window);
-	SDL_Vulkan_UnloadLibrary();
+	try
+	{
+		auto *app = new RenderGraphSandboxApplication();
+		return app;
+	}
+	catch (const std::exception &e)
+	{
+		LOGE("application_create() threw exception: %s\n", e.what());
+		return nullptr;
+	}
 }
+} // namespace Granite
