@@ -21,8 +21,6 @@
  */
 
 #include "device.hpp"
-#include "util.hpp"
-#include "vulkan.hpp"
 
 int main()
 {

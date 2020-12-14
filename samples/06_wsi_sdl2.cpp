@@ -20,10 +20,10 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "vulkan.hpp"
 #include "device.hpp"
-#include "wsi.hpp"
 #include "util.hpp"
+#include "vulkan.hpp"
+#include "wsi.hpp"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
@@ -45,7 +45,7 @@
 struct SDL2Platform : Vulkan::WSIPlatform
 {
 	explicit SDL2Platform(SDL_Window *window_)
-		: window(window_)
+	    : window(window_)
 	{
 	}
 
@@ -168,8 +168,7 @@ static bool run_application(SDL_Window *window)
 int main()
 {
 	// Quick and dirty SDL 2.0 app.
-	SDL_Window *window = SDL_CreateWindow("06-wsi-sdl2", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-	                                      640, 360,
+	SDL_Window *window = SDL_CreateWindow("06-wsi-sdl2", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 640, 360,
 	                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
 	if (!window)
 	{
@@ -178,7 +177,7 @@ int main()
 	}
 
 	// Init loader with GetProcAddr directly from SDL2 rather than letting Granite load the Vulkan loader.
-	if (!Vulkan::Context::init_loader((PFN_vkGetInstanceProcAddr) SDL_Vulkan_GetVkGetInstanceProcAddr()))
+	if (!Vulkan::Context::init_loader((PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr()))
 	{
 		LOGE("Failed to create loader!\n");
 		return 1;

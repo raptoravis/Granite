@@ -20,9 +20,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "vulkan.hpp"
 #include "device.hpp"
-#include "util.hpp"
 
 // See sample 02_object_creation.
 Vulkan::BufferHandle create_buffer(Vulkan::Device &device)

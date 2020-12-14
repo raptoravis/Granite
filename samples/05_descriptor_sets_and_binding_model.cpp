@@ -20,13 +20,11 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "vulkan.hpp"
 #include "device.hpp"
-#include "util.hpp"
 
 static const uint32_t simple_comp[] =
 #include "shaders/simple.comp.inc"
-;
+    ;
 
 // See 02_object_creation.
 static Vulkan::BufferHandle create_ssbo(Vulkan::Device &device, const void *initial_data, VkDeviceSize size)

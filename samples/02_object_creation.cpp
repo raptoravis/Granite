@@ -20,9 +20,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "vulkan.hpp"
 #include "device.hpp"
-#include "util.hpp"
 
 static Vulkan::BufferHandle create_buffer(Vulkan::Device &device)
 {
@@ -79,10 +77,7 @@ static Vulkan::ImageHandle create_image(Vulkan::Device &device)
 
 	Vulkan::ImageInitialData initial_data = {};
 	static const uint32_t checkerboard[] = {
-		0u, ~0u, 0u, ~0u,
-		~0u, 0u, ~0u, 0u,
-		0u, ~0u, 0u, ~0u,
-		~0u, 0u, ~0u, 0u,
+		0u, ~0u, 0u, ~0u, ~0u, 0u, ~0u, 0u, 0u, ~0u, 0u, ~0u, ~0u, 0u, ~0u, 0u,
 	};
 	initial_data.data = checkerboard;
 

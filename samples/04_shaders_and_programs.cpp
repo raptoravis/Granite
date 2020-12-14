@@ -20,9 +20,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "vulkan.hpp"
 #include "device.hpp"
-#include "util.hpp"
 
 // For simplicity sake, we have used glslc (shaderc project) to compile GLSL to SPIR-V, expressed as a
 // nice little uint32_t C array.
@@ -30,11 +28,11 @@
 // creation API in Granite, and is not really important from a Vulkan API design point of view.
 static const uint32_t simple_vert[] =
 #include "shaders/simple.vert.inc"
-;
+    ;
 
 static const uint32_t simple_frag[] =
 #include "shaders/simple.frag.inc"
-;
+    ;
 
 int main()
 {
